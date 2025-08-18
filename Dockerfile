@@ -18,7 +18,10 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml* ./
 
 # Cài corepack và dependencies
-RUN corepack enable && pnpm install && pnpm exec puppeteer browsers install chrome@latest
+RUN corepack enable && pnpm install && pnpm exec puppeteer browsers install chrome@141.0.7362.0
+
+ENV PUPPETEER_EXECUTABLE_PATH=/root/.cache/puppeteer/chrome/linux-141.0.7362.0/chrome-linux64/chrome
+
 
 # Copy toàn bộ source code (để build image đầy đủ, còn dev thì sẽ mount volume)
 COPY . .

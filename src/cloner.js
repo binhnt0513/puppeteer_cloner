@@ -34,7 +34,7 @@ async function launchBrowserWithProxy() {
             "--disable-features=NetworkService",
             ...args
         ],
-        executablePath: "/root/.cache/puppeteer/chrome/linux-141.0.7362.0/chrome-linux64/chrome"
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
     });
 
     if (proxy?.user && proxy?.pass) {
