@@ -1,0 +1,9 @@
+services:
+  cloner:
+    build: .
+    volumes:
+      - .:/app            # mount toàn bộ source code realtime
+      - /app/node_modules # giữ node_modules trong container, không bị ghi đè
+    working_dir: /app
+    tty: true   # giữ container chạy
+    stdin_open: true

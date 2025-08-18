@@ -1,0 +1,21 @@
+# Bỏ thư mục output (clone kết quả)
+cloned_site/
+*.log
+*.txt
+
+# Bỏ toàn bộ thư mục website đã clone
+*.net/
+*.com/
+*.org/
+
+# Node.js build artifacts
+node_modules
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.idea
+.vscode
