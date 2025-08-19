@@ -1,4 +1,9 @@
-import puppeteer from "puppeteer";
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+puppeteer.use(StealthPlugin());
+
+
 import fs from "fs-extra";
 import path from "path";
 import cliProgress from "cli-progress";
@@ -7,8 +12,53 @@ import {COLLECT_ONLY, DONE_FILE, MAX_DEPTH, MAX_PAGES, OUTPUT_DIR, saveProgress}
 import {getNextProxy, loadProxies} from "./proxy.js";
 
 const DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
+// const OUTPUT_DIR = "./crawl-data";
+const VISITED_FILE = path.join(OUTPUT_DIR, "visited.json");
+const TREE_FILE = path.join(OUTPUT_DIR, "results.json");
 
-loadProxies();
+function loadJson(file, fallback) {
+    if (fs.existsSync(file)) {
+        return JSON.parse(fs.readFileSync(file, "utf8"));
+    }
+    return fallback;
+}
+
+function saveJson(file, data) {
+    if (data === undefined || data === null) {
+        console.warn(`⚠️ Skip saving ${file} because data is null/undefined`);
+        return;
+    }
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf-8");
+}
+
+// tìm node trong cây theo url
+function findNode(root, url) {
+    if (root.url === url) return root;
+    if (!root.children) return null;
+    for (const child of root.children) {
+        const found = findNode(child, url);
+        if (found) return found;
+    }
+    return null;
+}
+
+function normalizeUrl(url) {
+    try {
+        const u = new URL(url);
+        u.hash = ""; // bỏ fragment (#...)
+        u.search = ""; // có thể bỏ query nếu không muốn coi ?x=y là URL mới
+
+        // Chuẩn hóa root path: https://znews.vn/ -> https://znews.vn
+        if (u.pathname === "/" || u.pathname === "") {
+            u.pathname = "";
+        }
+
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+// loadProxies();
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -17,6 +67,11 @@ function sleep(ms) {
 function randomDelay(min = 2000, max = 5000) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
+
+function sanitizeFilename(url) {
+    return url.replace(/[^a-z0-9]/gi, "_").slice(0, 100);
+}
+
 
 async function launchBrowserWithProxy() {
     const proxy = getNextProxy();
@@ -29,9 +84,14 @@ async function launchBrowserWithProxy() {
         headless: true,
         args: [
             "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-http2",
-            "--disable-features=NetworkService",
+            "--disable-http2", // 👈 ép dùng HTTP/1.1
+            // "--disable-setuid-sandbox",
+            // "--disable-dev-shm-usage",
+            // "--disable-blink-features=AutomationControlled",
+            // "--disable-features=site-per-process",
+            // "--no-zygote",
+            // "--single-process",
+            // "--disable-features=NetworkService",
             ...args
         ],
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
@@ -47,7 +107,11 @@ async function launchBrowserWithProxy() {
                         password: proxy.pass
                     });
                 }
-                await page.setUserAgent(DEFAULT_UA);
+                await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
+                await page.setExtraHTTPHeaders({
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Upgrade-Insecure-Requests": "1"
+                });
             } catch {
             }
         });
@@ -57,16 +121,13 @@ async function launchBrowserWithProxy() {
 
 async function safeGoto(page, url, timeoutMs = 15000) {
     try {
-        await Promise.race([
-            page.goto(url, { waitUntil: "domcontentloaded", timeout: 0 }),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("ManualTimeout")), timeoutMs)
-            )
-        ]);
-        return true;
+        await page.goto(url, {
+            waitUntil: ["domcontentloaded", "networkidle2"],
+            timeout: 60000, // tăng lên 60s
+        });
     } catch (err) {
-        console.warn(`⚠️ Goto failed for ${url}:`, err.message);
-        return false;
+        console.warn(`⚠️ Goto failed for ${url}: ${err.message}`);
+        return [];
     }
 }
 
@@ -143,47 +204,89 @@ async function processPage(targetUrl) {
     return true;
 }
 
-async function collectUrls(startUrl, maxPages, maxDepth = 3) {
+async function collectUrls(startUrl, maxDepth = 3) {
+    if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+    // load dữ liệu cũ
+    let visited = new Set(loadJson(VISITED_FILE, []));
+    let tree = loadJson(TREE_FILE, null);
+
+    const rootUrl = normalizeUrl(startUrl);
+    if (!tree) {
+        tree = { url: rootUrl, depth: 0, children: [] };
+    }
+
+    const baseDomain = new URL(rootUrl).hostname;
     const browser = await launchBrowserWithProxy();
-    const baseDomain = new URL(startUrl).hostname;
-    const visited = new Set([startUrl]);
-    const queue = [{url: startUrl, depth: 0}];
 
-    while (queue.length > 0 && visited.size < maxPages) {
-        const {url, depth} = queue.shift();
-        if (depth >= maxDepth) continue; // không đi sâu hơn giới hạn
+    const queue = [{ url: rootUrl, depth: 0 }];
 
-        const links = await extractLinks(browser, url, baseDomain);
-        for (const link of links) {
-            try {
-                const linkDomain = new URL(link).hostname;
-                // chỉ cho phép tiếp tục crawl nếu cùng domain
-                if (linkDomain === baseDomain && !visited.has(link) && visited.size < maxPages) {
-                    visited.add(link);
-                    queue.push({url: link, depth: depth + 1});
+    while (queue.length > 0) {
+        const { url, depth } = queue.shift();
+        const normalizedUrl = normalizeUrl(url);
+
+        if (visited.has(normalizedUrl)) continue;
+        if (depth > maxDepth) continue;
+
+        console.log(`🌐 Crawling [${depth}] ${normalizedUrl}`);
+
+        let links = await extractLinks(browser, normalizedUrl, baseDomain);
+
+        // lọc bỏ file media/js/css
+        links = links
+            .map(normalizeUrl)
+            .filter(l => {
+                try {
+                    const u = new URL(l);
+                    if (u.hostname !== baseDomain) return false;
+                    return !/\.(jpg|jpeg|png|gif|svg|ico|css|js|woff2?|ttf|mp4|webm)$/i.test(u.pathname);
+                } catch {
+                    return false;
                 }
-            } catch {
-                // bỏ qua link lỗi parse
+            });
+
+        // tạo node trong cây
+        const parentNode = findNode(tree, normalizedUrl);
+        if (parentNode) {
+            parentNode.children = parentNode.children || [];
+            for (const link of links) {
+                const normalizedLink = normalizeUrl(link);
+                if (!visited.has(normalizedLink) &&
+                    !parentNode.children.some(c => c.url === normalizedLink)) {
+                    parentNode.children.push({
+                        url: normalizedLink,
+                        depth: depth + 1,
+                        children: []
+                    });
+                    queue.push({ url: normalizedLink, depth: depth + 1 });
+                }
             }
         }
+
+        // đánh dấu visited và lưu ra file
+        visited.add(normalizedUrl);
+        saveJson(VISITED_FILE, [...visited]);
+        saveJson(TREE_FILE, tree);
+
+        console.log(`✅ Saved node: ${normalizedUrl} (${links.length} children)`);
     }
 
     await browser.close();
-    return Array.from(visited);
+    console.log("🎉 Done crawling!");
 }
 
 
 export async function cloneSite(startUrl) {
-    const urls = await collectUrls(startUrl, MAX_PAGES, MAX_DEPTH);
-    console.log("Collected URLs:", urls.length);
+    const tree = await collectUrls(startUrl, MAX_DEPTH);
+    console.log("✅ Crawl tree built");
 
-    const urlsFile = path.join(OUTPUT_DIR, "urls.txt");
+    const treeFile = path.join(OUTPUT_DIR, "tree.json");
     await fs.ensureDir(OUTPUT_DIR);
-    await fs.writeFile(urlsFile, urls.join("\n"));
-    console.log("Saved URL list to", urlsFile);
+    await fs.writeJson(treeFile, tree, { spaces: 2 });
+    console.log("Saved crawl tree to", treeFile);
 
     if (COLLECT_ONLY) {
-        console.log("Collect-only mode enabled. Exiting after saving URLs.");
+        console.log("Collect-only mode enabled. Exiting after saving tree.");
         return;
     }
 
@@ -194,41 +297,50 @@ export async function cloneSite(startUrl) {
         done = new Set(doneList.split("\n").filter(Boolean));
     }
 
-    // Lọc ra danh sách URL chưa chạy
-    const pending = urls.filter(u => !done.has(u));
-    console.log("Pending URLs:", pending.length);
+    // Tính tổng số node trong tree
+    const countNodes = (node) =>
+        1 + (node.children ? node.children.reduce((sum, c) => sum + countNodes(c), 0) : 0);
+    const totalNodes = countNodes(tree);
 
     const browser = await launchBrowserWithProxy();
     const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
-    bar.start(pending.length, 0);
+    bar.start(totalNodes, done.size);
 
-    for (let i = 0; i < pending.length; i++) {
-        const url = pending[i];
-        let success = false;
+    // DFS clone
+    async function dfsClone(node) {
+        const url = node.url;
 
-        // Retry tối đa 3 lần
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            success = await processPage(browser, url);
-            if (success) break;
-            console.warn(`Retry ${attempt}/3 failed for ${url}`);
-        }
+        if (!done.has(url)) {
+            let success = false;
 
-        if (success) {
-            done.add(url);
-            await saveProgress(done); // ghi ngay DONE_FILE để lưu trạng thái
-        } else {
-            console.error(`❌ Skip after 3 retries: ${url}`);
-        }
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                success = await processPage(browser, url);
+                if (success) break;
+                console.warn(`Retry ${attempt}/3 failed for ${url}`);
+            }
 
-        bar.update(i + 1);
+            if (success) {
+                done.add(url);
+                await saveProgress(done);
+            } else {
+                console.error(`❌ Skip after 3 retries: ${url}`);
+            }
 
-        // 👉 Thêm delay ngẫu nhiên giữa các lần clone
-        if (i < pending.length - 1) {
+            bar.update(done.size);
+
             const delay = randomDelay(2000, 5000);
-            console.log(`⏳ Delay ${delay}ms trước khi clone trang tiếp theo...`);
+            console.log(`⏳ Delay ${delay}ms trước khi clone tiếp...`);
             await sleep(delay);
         }
+
+        if (node.children && node.children.length > 0) {
+            for (const child of node.children) {
+                await dfsClone(child);
+            }
+        }
     }
+
+    await dfsClone(tree);
 
     bar.stop();
     await browser.close();
